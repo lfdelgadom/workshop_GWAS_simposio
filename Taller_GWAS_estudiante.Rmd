@@ -1,0 +1,627 @@
+---
+title: "Taller práctico: GWAS en múltiples ambientes"
+subtitle: "Del fenotipo multiambiente a las regiones del genoma · Cuaderno del estudiante"
+author: "IV Simposio de Bioinformática, Biología Computacional y Modelado"
+date: "`r format(Sys.Date(), '%d/%m/%Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    df_print: paged
+---
+
+```{css, echo = FALSE}
+.pregunta  { background:#F3EAF6; border-left:5px solid #811E82; padding:10px 14px; margin:14px 0; border-radius:4px; }
+.respuesta { background:#EEF6EA; border-left:5px solid #4E8F35; padding:10px 14px; margin:8px 0 18px; border-radius:4px; }
+.docente   { background:#FFF7E6; border-left:5px solid #D99A1E; padding:10px 14px; margin:14px 0; border-radius:4px; }
+.clave     { background:#E9F1F8; border-left:5px solid #2E6E9E; padding:10px 14px; margin:14px 0; border-radius:4px; }
+```
+
+```{r setup, include = FALSE}
+# Opciones globales del documento
+knitr::opts_chunk$set(
+  echo = TRUE,        # mostrar el código
+  message = FALSE,    # ocultar mensajes de carga de paquetes
+  warning = FALSE,    # ocultar advertencias
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 5
+)
+```
+
+# Introducción
+
+## ¿Qué vamos a hacer?
+
+Un **estudio de asociación del genoma completo (GWAS)** busca regiones del genoma en las que la variación de los marcadores moleculares (SNPs) se asocia con la variación de un rasgo. En este taller recorreremos el camino completo:
+
+```         
+Ensayos en varios ambientes  →  modelo mixto (G, G×E)  →  valores genotípicos predichos (BLUPs)
+  →  matriz de parentesco  →  GWAS  →  Manhattan y QQ plot  →  SNPs significativos y sus efectos
+```
+
+**Objetivos de aprendizaje.** Al terminar el taller usted podrá:
+
+1.  Cuantificar la importancia de la interacción genotipo × ambiente (G×E) con un modelo mixto y un biplot GGE.
+2.  Obtener valores genotípicos predichos para el efecto principal del genotipo y para cada época de siembra.
+3.  Construir e interpretar una matriz de parentesco genómico.
+4.  Ajustar un GWAS con corrección por parentesco e interpretar el Manhattan plot, el QQ plot y los efectos de los QTL.
+
+## El estudio de origen de los datos
+
+> Bustos-Korts, D., *et al.* (2019). Exome sequences and multi-environment field trials elucidate the genetic basis of adaptation in barley. *The Plant Journal*, 99(6), 1172–1191. <https://doi.org/10.1111/tpj.14414>
+
+El estudio analizó **371 materiales domesticados de cebada** del panel WHEALBI, incluyendo variedades mejoradas y variedades tradicionales de distintos orígenes geográficos, con tipos de espiga de dos y seis hileras. Combinó **secuenciación del exoma** (principalmente regiones codificantes del genoma) y **ensayos de campo en distintos ambientes** para investigar la base genética de la adaptación. El estudio original incluyó ensayos en Escocia, Hungría e Italia; la versión del taller utiliza **cuatro ensayos**.
+
+Los **14.000 SNPs** del taller son una **muestra didáctica**; no representan todos los marcadores utilizados en la publicación.
+
+## Los archivos del taller
+
+| Archivo | Contenido | Función en el análisis |
+|------------------------|------------------------|------------------------|
+| `WHEALBI_pheno.csv` | **1.484 filas y 8 columnas**: 371 materiales × 4 ambientes. Incluye siembra, ambiente, genotipo, tipo de espiga, subpoblación, peso de grano, *Heading* y altura. | Ajustar el modelo fenotípico y obtener las respuestas para el GWAS. |
+| `WHEALBI_scores_sampledSNP.csv` | **371 materiales × 14.000 SNPs**, con códigos alélicos 0, 1 y 2. | Calcular relaciones genómicas y probar asociaciones entre marcadores y respuesta. |
+| `WHEALBI_map_sampledSNP.csv` | **14.000 marcadores**, cada uno con cromosoma (`chr`) y posición (`pos`). | Ubicar las asociaciones en el genoma y construir el Manhattan plot. |
+
+| Época de siembra     | Ensayos            |
+|----------------------|--------------------|
+| Primavera (`spring`) | `BS2JHI`, `BS3ATK` |
+| Invierno (`winter`)  | `BW2JHI`, `BW3ATK` |
+
+El rasgo principal es ***Heading***: **días hasta la emergencia de la espiga**, contados desde la fecha de siembra. En el archivo hay 28 valores ausentes, por lo que el modelo utiliza **1.456 mediciones válidas**.
+
+> **Antes de empezar:** abra el proyecto de RStudio del taller (o su proyecto en Posit Cloud) para que los tres archivos `.csv` estén en el directorio de trabajo.
+
+# Preparación
+
+## Paquetes
+
+Primero verificamos si los paquetes necesarios están instalados. Este bloque **sólo se ejecuta una vez** (por eso no corre al tejer el documento): ejecútelo a mano si le faltan paquetes.
+
+```{r instalar-paquetes, eval = FALSE}
+## Paquetes (instalación)
+# Lista de paquetes ya instalados en este computador
+pkgs <- rownames(installed.packages())
+# Instalar statgenGWAS sólo si no está instalado
+if (!("statgenGWAS" %in% pkgs)) {install.packages("statgenGWAS")}
+# pheatmap: mapas de calor con agrupamiento (para la matriz de parentesco)
+# install.packages("pheatmap")
+```
+
+Ahora cargamos los paquetes:
+
+- `tidyverse`: manipulación de datos (`%>%`, `select()`, `pivot_wider()`, etc.).
+- `statgenSTA`: estructura de datos de ensayos (`createTD()`).
+- `statgenGxE`: análisis de interacción G×E (`gxeGGE()`).
+- `statgenGWAS`: parentesco (`kinship()`) y GWAS (`runSingleTraitGwas()`).
+
+```{r cargar-paquetes}
+# Manipulación y visualización de datos
+library(tidyverse)
+# Análisis de ensayos individuales (crea objetos TD)
+library(statgenSTA)
+# Análisis de interacción genotipo x ambiente
+library(statgenGxE)
+# Parentesco genómico y GWAS
+library(statgenGWAS)
+```
+
+## Datos fenotípicos
+
+```{r cargar-fenotipo}
+## Cargar los datos fenotípicos
+pheno <- read.csv("WHEALBI_pheno.csv")
+# Explorar las primeras filas
+head(pheno)
+```
+
+# Ejercicio 1 · Caracterización de la G×E y predicción de respuestas fenotípicas
+
+El primer paso es cuantificar la importancia de la G×E para la situación de mejoramiento de interés:
+
+- Si la **G×E es pequeña**, conviene usar las medias genotípicas a través de los ambientes para identificar QTL.
+- Si el mejorador quiere identificar QTL que confieran **adaptación a ambientes específicos**, puede ser interesante correr un GWAS para cada grupo de ambientes, o usar como fenotipo la **diferencia** entre grupos de ambientes.
+
+## Modelo mixto para cuantificar la G×E
+
+Las variables de clasificación deben ser **factores** (variables categóricas):
+
+```{r factores}
+# Convertir siembra, ambiente y genotipo en factores (variables categóricas)
+pheno$sowing <- as.factor(pheno$sowing)
+pheno$env <- as.factor(pheno$env)
+pheno$geno <- as.factor(pheno$geno)
+```
+
+Ajustamos un modelo lineal mixto con `lme4`:
+
+```         
+Heading(i,j,k) = μ + Ambiente(j) + G(i) + (G × S)(i,k) + ε(i,j,k)
+```
+
+- **Ambiente** (`env`): efecto **fijo**; corrige que cada ensayo tiene un promedio distinto.
+- **Genotipo** (`geno`): efecto **aleatorio** → varianza genotípica σ²G.
+- **Genotipo × época de siembra** (`geno:sowing`): efecto **aleatorio** → varianza de la G×E explicada por la época de siembra σ²GS.
+- **Residual**: incluye la G×E dentro de cada época (entre ensayos de la misma época) y el error.
+
+```{r modelo-mixto}
+# Modelos lineales mixtos
+library(lme4)
+
+# Modelo mixto: ambiente fijo; genotipo y genotipo x siembra aleatorios
+m1 <- lmer(
+  Heading ~ env +
+    (1 | geno) +
+    (1 | geno:sowing),
+  data = pheno
+)
+```
+
+```{r componentes-varianza}
+# Componentes de varianza del modelo
+vc <- as.data.frame(VarCorr(m1))
+
+# Mostrar sólo el grupo (fuente de variación) y la varianza estimada
+vc[, c("grp", "vcov")]
+```
+
+## Biplot GGE
+
+Una alternativa para explorar la estructura de la G×E es ajustar un modelo **GGE** (genotipo + genotipo × ambiente). En el biplot GGE:
+
+- El **PC1** está relacionado con el efecto principal del genotipo, y el **PC2** con la parte de G×E.
+- El **ángulo entre los vectores de los ambientes** está relacionado con la G×E: si el ángulo es pequeño, hay poca G×E entre esos ensayos; si es grande, hay mucha.
+
+```{r gge, fig.height = 6}
+# Explorar los datos fenotípicos con el modelo GGE
+
+# Crear un objeto TD (datos de ensayos) para el análisis G x E con statgenGxE
+TD <- createTD(pheno, genotype = "geno", trial = "env")
+
+# Ajustar el modelo GGE con dos componentes principales
+gge <- gxeGGE(TD = TD, nPC = 2, trait = "Heading")
+
+# Resumen: tabla ANOVA y puntajes (scores) de los ambientes
+summary(gge)
+
+# Biplot GGE
+plot(gge, scale = 0.5, plotType = "GGE2", sizeGeno = 3)
+```
+
+::: pregunta
+**Pregunta 1.** Ajuste el modelo de componentes de varianza para la época de siembra. ¿Hay una G×E grande en este conjunto de datos?
+:::
+
+**Respuesta:**
+
+ 
+
+ 
+
+::: pregunta
+**Pregunta 2.** ¿En qué medida la G×E se explica por las épocas de siembra?
+:::
+
+**Respuesta:**
+
+ 
+
+ 
+
+::: pregunta
+**Pregunta 3.** Con base en los tamaños relativos de los componentes de varianza, ¿seleccionaría para adaptación amplia o específica? ¿Por qué?
+:::
+
+**Respuesta:**
+
+ 
+
+ 
+
+
+## Valores genotípicos predichos para el efecto principal del genotipo
+
+Usaremos el modelo ajustado `m1` para predecir el *Heading* de cada genotipo a través de todos los ambientes. Como el genotipo es un efecto aleatorio, `ranef()` entrega sus **BLUPs** (mejores predictores lineales insesgados): la **desviación** de cada genotipo respecto a la media, con *shrinkage* (encogimiento) hacia cero.
+
+```{r blups-genotipo}
+# Extraer los BLUPs de los genotipos (desviaciones respecto a la media)
+main <- ranef(m1)$geno
+
+# Convertir los nombres de fila (WB001, WB002...) en una columna
+main$genotype <- rownames(main)
+
+# Renombrar la columna del BLUP
+colnames(main)[1] <- "predicted.value"
+
+# Conservar sólo las columnas necesarias
+main <- main[, c("genotype", "predicted.value")]
+
+head(main)
+```
+
+Distribución de los BLUPs de los genotipos:
+
+```{r hist-blups}
+# Distribución de los BLUPs de los genotipos
+hist(main$predicted.value,
+     main = "Distribution of genotype BLUPs",
+     xlab = "BLUP for Heading")
+```
+
+Para expresar el BLUP en **días a espigamiento**, le sumamos el intercepto del modelo (μ):
+
+```{r valor-predicho}
+# Extraer de nuevo los BLUPs de los genotipos (mu + main$BLUP)
+main <- ranef(m1)$geno
+main$geno <- rownames(main)
+names(main)[1] <- "BLUP"
+
+# Intercepto general del modelo
+mu <- fixef(m1)["(Intercept)"]
+
+# Valor genotípico predicho = intercepto + BLUP
+main$predicted.value <- mu + main$BLUP
+
+head(main)
+
+hist(main$predicted.value,
+     main = "Distribution of predicted Heading",
+     xlab = "Predicted Heading")
+```
+
+## Contraste entre ensayos de primavera e invierno
+
+Ahora predecimos el *Heading* de cada genotipo en una **siembra de primavera promedio** y en una **siembra de invierno promedio**, combinando el BLUP del genotipo con el BLUP de la interacción genotipo × siembra (ambiente):
+
+```         
+valor(genotipo i, época) = G(i) + (G × S)(i, época)
+```
+
+```{r blups-siembra}
+# BLUPs de los genotipos
+geno_blup <- ranef(m1)$geno %>%
+  tibble::rownames_to_column("geno") %>%
+  rename(geno_BLUP = `(Intercept)`)
+
+# BLUPs de la interacción genotipo x siembra
+sowing <- ranef(m1)$`geno:sowing` %>%
+  tibble::rownames_to_column("geno_sowing") %>%
+  rename(GxS_BLUP = `(Intercept)`)
+
+head(sowing)
+
+# Separar "WB001:spring" en dos columnas: genotipo y época de siembra
+sowing <- sowing %>%
+  separate(
+    geno_sowing,
+    into = c("geno", "sowing"),
+    sep = ":"
+  )
+
+# Unir con el BLUP del genotipo y sumar ambos efectos
+sowing <- sowing %>%
+  left_join(geno_blup, by = "geno") %>%
+  mutate(predicted.value = geno_BLUP + GxS_BLUP)
+
+head(sowing)
+```
+
+```{r formato-ancho}
+# Pasar a formato ancho: una fila por genotipo, una columna por época de siembra
+sow_wide <- sowing %>%
+  select(geno, sowing, predicted.value) %>%
+  pivot_wider(
+    names_from = sowing,
+    values_from = predicted.value
+  )
+
+head(sow_wide)
+```
+
+```{r primavera-vs-invierno, fig.width = 6, fig.height = 6}
+# Respuesta de cada genotipo en primavera vs. invierno
+plot(
+  sow_wide$spring,
+  sow_wide$winter,
+  xlab = "Predicted Heading - Spring",
+  ylab = "Predicted Heading - Winter",
+  main = "Genotype response: Spring vs Winter"
+)
+
+# Línea 1:1 (misma respuesta en ambas épocas)
+abline(0, 1, col = "red", lty = 2)
+```
+
+```{r diferencia}
+# Diferencia entre primavera e invierno para cada genotipo
+sow_wide <- sow_wide %>%
+  mutate(diff = spring - winter)
+
+hist(
+  sow_wide$diff,
+  main = "Spring - Winter difference",
+  xlab = "Difference in predicted Heading"
+)
+```
+
+::: pregunta
+**Pregunta de discusión.** *(Pregunta de discusión)* En el gráfico primavera vs. invierno, ¿qué significaría que todos los puntos cayeran sobre una recta? ¿Y qué significan los puntos que se alejan de ella?
+:::
+
+**Respuesta:**
+
+ 
+
+ 
+
+**Pregunta guía para el resto del taller:** *¿Qué regiones genómicas están asociadas con la respuesta diferencial a los ensayos sembrados en primavera y en invierno?*
+
+# Ejercicio 2 · GWAS para encontrar QTL del efecto principal
+
+Usaremos el paquete `statgenGWAS`. En este ejercicio, el **valor genotípico predicho** (efecto principal del genotipo) será el fenotipo para el que buscaremos QTL.
+
+## Datos genotípicos y mapa
+
+```{r cargar-genotipos}
+# Uso del GWAS para encontrar QTL del efecto principal
+## Cargar los datos genotípicos y el mapa
+snp <- read.csv("WHEALBI_scores_sampledSNP.csv")
+map <- read.csv("WHEALBI_map_sampledSNP.csv")
+
+# Dimensiones de los datos de SNPs y del mapa
+dim(snp)
+dim(map)
+head(map)
+```
+
+::: pregunta
+**Pregunta 5.** ¿Cuáles son las dimensiones de los datos de SNPs y del mapa?
+:::
+
+**Respuesta:**
+
+ 
+
+ 
+
+::: pregunta
+**Pregunta 6.** ¿Qué contienen los datos fenotípicos? ¿Qué hay en las filas y en las columnas?
+:::
+
+**Respuesta:**
+
+ 
+
+ 
+
+## Matriz de parentesco genómico
+
+La **matriz de parentesco** (*kinship*) indica la similitud genética entre genotipos, calculada a partir de los SNPs. Debe tener dimensiones **371 × 371**, porque tenemos 371 genotipos.
+
+Para construirla, los datos de SNPs deben estar en formato **matriz** (ahora están en un `data.frame`), y los nombres de fila deben corresponder a los genotipos. Luego usamos la función `kinship()` de `statgenGWAS`.
+
+```{r parentesco}
+# Calcular el parentesco
+# Convertir los SNPs a matriz (lo exige statgenGWAS)
+snp2mat <- as.matrix(snp)
+# Asegurar que los nombres de fila sean los genotipos
+row.names(snp2mat) <- row.names(snp)
+snp[1:10, 1:5]
+
+# Usar los SNPs de todos los cromosomas para calcular el parentesco
+kin <- kinship(snp2mat, method = "astle")
+dim(kin)
+```
+
+```{r heatmap-parentesco, fig.width = 7, fig.height = 7}
+# Mapa de calor de la matriz de parentesco (sin reordenar)
+heatmap(
+  kin,
+  Rowv = NA,
+  Colv = NA,
+  scale = "none",
+  labRow = NA,
+  labCol = NA,
+  main = "Genomic Kinship Matrix"
+)
+
+library(pheatmap)
+
+# Mapa de calor con agrupamiento jerárquico de los genotipos
+pheatmap(
+  kin,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  main = "Genomic Kinship Matrix"
+)
+```
+
+::: pregunta
+**Pregunta 7.** Ejecute `help(kinship)` para abrir la ayuda de la función. ¿Qué otras opciones hay para el argumento `method`?
+:::
+
+**Respuesta:**
+
+ 
+
+ 
+
+::: pregunta
+**Pregunta 8.** Verifique que la matriz de parentesco resultante tiene efectivamente 371 filas y 371 columnas.
+:::
+
+**Respuesta:**
+
+ 
+
+ 
+
+## Objeto gData
+
+Antes de correr el GWAS, `statgenGWAS` necesita los datos en formato **gData** (*genomic Data*). Para ello, los datos fenotípicos de cada "ensayo" deben estar en un `data.frame` separado dentro de una **lista**. Luego pasamos los SNPs, el mapa, los fenotipos y el parentesco a la función `createGData()`.
+
+```{r gdata}
+### Formato de los datos fenotípicos para el efecto principal del genotipo (promedio entre ensayos)
+# CORRECCIÓN: en el script original decía colnames(main)[1] <- "genotype". En este punto
+# 'main' tiene las columnas BLUP, geno y predicted.value; renombrar la columna 1 convertía
+# los BLUPs (números) en "genotype" y el GWAS no encontraba ningún genotipo
+# ("Data are available for 0 SNPs"). La columna que debe llamarse "genotype" es la 2 (geno).
+colnames(main)[2] <- "genotype"
+main <- main[,c('genotype', 'predicted.value')]
+mainlist <- list(main)
+names(mainlist) <- 'main'
+
+# Crear el objeto gData para el GWAS
+gData <- createGData(geno = snp2mat,
+                     map = map,
+                     kin = kin,
+                     pheno = mainlist)
+```
+
+## Ajuste del GWAS
+
+Con el objeto gData listo, usamos `runSingleTraitGwas()` para ajustar el modelo de GWAS. Para cada SNP se ajusta un modelo mixto que incluye el efecto del SNP y un efecto genético aleatorio con la matriz de parentesco (corrección por estructura de la población).
+
+Argumentos principales:
+
+- `genomicControl = FALSE`: no aplicar control genómico adicional.
+- `useMAF = TRUE, MAF = 0.05`: excluir SNPs con frecuencia del alelo menor \< 5 %.
+- `thrType = "fixed", LODThr = 4.5`: un SNP es significativo si −log₁₀(p) ≥ 4,5 (es decir, p ≤ 3,2 × 10⁻⁵).
+- `remlAlgo = "EMMA"`: algoritmo para estimar los componentes de varianza.
+
+```{r gwas}
+# GWAS con corrección por parentesco
+GWAS1 <- runSingleTraitGwas(gData = gData,
+                            genomicControl = FALSE,
+                            useMAF = TRUE,
+                            MAF = 0.05,
+                            thrType = "fixed",
+                            LODThr = 4.5,
+                            remlAlgo = "EMMA",
+                            trials = 'main',
+                            traits = "predicted.value")
+summary(GWAS1)
+```
+
+::: pregunta
+**Pregunta 9.** ¿Cuántos SNPs significativos hubo para la media del *Heading* a través de los ensayos?
+:::
+
+**Respuesta:**
+
+ 
+
+ 
+
+::: pregunta
+**Pregunta 10.** Indique el menor p-valor entre los SNPs significativos. Calcule el −log₁₀(p) de ese p-valor.
+:::
+
+**Respuesta:**
+
+ 
+
+ 
+
+## Manhattan plot
+
+El **Manhattan plot** muestra cada SNP según su posición en el genoma (eje X, cromosoma por cromosoma) y la fuerza de su asociación, −log₁₀(p) (eje Y). La línea horizontal es el umbral de significancia.
+
+```{r manhattan, fig.width = 10}
+# Manhattan plot para el efecto principal
+plot(GWAS1,
+     trial = "main",
+     plotType = "manhattan")
+```
+
+::: pregunta
+**Pregunta 11.** ¿Cuántos QTL hay para el efecto principal del genotipo?
+:::
+
+**Respuesta:**
+
+ 
+
+ 
+
+::: pregunta
+**Pregunta 12.** ¿En qué cromosomas están?
+:::
+
+**Respuesta:**
+
+ 
+
+ 
+
+## QQ plot
+
+Ahora verificamos si la corrección por estructura de la población fue suficiente. El **QQ plot** compara los p-valores observados con los esperados si ningún SNP estuviera asociado (línea diagonal).
+
+```{r qq, fig.width = 6, fig.height = 6}
+# QQ plot para el efecto principal
+plot(GWAS1,
+     trial = "main",
+     plotType = "qq")
+```
+
+::: pregunta
+**Pregunta 13.** ¿Reflejan los QQ plots inflación? Para responder, revise también el *factor de inflación de control genómico* (*Genomic control inflation-factor*) del resumen del GWAS (un factor de 1 indica que no hay inflación después de corregir por estructura de la población).
+:::
+
+**Respuesta:**
+
+ 
+
+ 
+
+## Efectos de los QTL
+
+Por último, revisamos los detalles de los SNPs significativos. Columnas principales:
+
+- `snp`, `chr`, `pos`: identificación y ubicación del SNP.
+- `allFreq`: frecuencia del alelo cuyo efecto se estima.
+- `pValue`, `LOD`: significancia.
+- `effect`, `effectSe`: efecto estimado del alelo (en días) y su error estándar.
+- `propSnpVar`: proporción de la varianza explicada por el SNP.
+
+```{r efectos-qtl}
+# Efectos de los QTL
+# Mostrar los detalles de los SNPs significativos
+GWAS1$signSnp$main
+
+# Guardar la tabla de SNPs significativos en un objeto
+bla <- GWAS1$signSnp$main
+```
+
+::: pregunta
+**Pregunta 14.** ¿Qué SNP tiene el mayor efecto?
+:::
+
+**Respuesta:**
+
+ 
+
+ 
+
+::: pregunta
+**Pregunta 15.** ¿Cómo interpretaría este efecto?
+:::
+
+**Respuesta:**
+
+ 
+
+ 
+
+# Cierre
+
+**Ideas principales del taller:**
+
+1.  Antes de un GWAS hay que entender la **estructura del fenotipo**: cuánta varianza es genética (G) y cuánta es interacción con el ambiente (G×E).
+2.  El fenotipo que entra al GWAS (media genotípica, valor por época, diferencia entre épocas) **define la pregunta biológica** que se responde.
+3.  El **parentesco** controla los falsos positivos debidos a la estructura de la población; el **QQ plot** y el factor λ permiten verificarlo.
+4.  Un SNP significativo marca una **región**, no un gen. El siguiente paso es bioinformático: ubicar la región en el genoma de referencia (en la versión correcta), revisar los genes candidatos y buscar evidencia en la literatura.
